@@ -88,7 +88,11 @@ pub fn bucket_size() -> usize {
 
 /// Defines the target max number of contacts for the whole routing table. This is not a hard limit;
 /// the table size can exceed this size if required.
+#[cfg(not(test))]
 const OPTIMAL_TABLE_SIZE: u8 = 64;
+/// For tests use a smaller size, since the tests use a smaller simulated network.
+#[cfg(test)]
+const OPTIMAL_TABLE_SIZE: u8 = 16;
 
 /// optimal table size as usize
 pub fn optimal_table_size() -> usize {
@@ -441,6 +445,8 @@ mod test {
     extern crate bit_vec;
     use super::{RoutingTable, NodeInfo, group_size, optimal_table_size, parallelism, quorum_size,
                 HasName};
+    use std::collections;
+    use xor_name::XorName;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestNodeInfo {
@@ -1243,5 +1249,192 @@ mod test {
         // Check the bucket index of our own name is 512
         assert_eq!(::xor_name::XOR_NAME_LEN * 8,
                    routing_table.bucket_index(&our_name));
+    }
+
+    /// The status of a message in the network: Which nodes have seen it, which currently have it.
+    struct MessageStatus {
+        seen: collections::HashSet<XorName>,
+        current: Vec<XorName>,
+    }
+
+    impl MessageStatus {
+        /// A new message, currently only at the given node.
+        fn new(start: XorName) -> MessageStatus {
+            MessageStatus {
+                seen: vec!(start.clone()).into_iter().collect(),
+                current: vec!(start),
+            }
+        }
+
+        /// Remove and return one of the current nodes to handle the message there.
+        fn pop(&mut self) -> Option<XorName> {
+            self.current.pop()
+        }
+
+        /// Send the message to the given node, i. e. add the node to the current ones if it has
+        /// not already seen the message.
+        fn add(&mut self, name: XorName) {
+            if !self.seen.contains(&name) {
+                self.seen.insert(name.clone());
+                self.current.push(name);
+            }
+        }
+    }
+
+    fn to_node_info(name: &XorName) -> NodeInfo<TestNodeInfo, u64> {
+        NodeInfo {
+            public_id: TestNodeInfo { name: name.clone() },
+            connections: Vec::new(),
+            bucket_index: 0,
+        }
+    }
+
+    /// A whole network of nodes with routing tables.
+    struct NetworkTestEnvironment {
+        tables: collections::HashMap<XorName, RoutingTable<TestNodeInfo, u64>>,
+    }
+
+    impl NetworkTestEnvironment {
+        /// Create a new test network with one node.
+        fn new() -> NetworkTestEnvironment {
+            let node_info = create_random_node_info();
+            let table = RoutingTable::new(node_info.name());
+            NetworkTestEnvironment {
+                tables: vec!((node_info.name().clone(), table)).into_iter().collect()
+            }
+        }
+
+        fn get_random_name(&self) -> Option<XorName> {
+            let mut rng = ::rand::thread_rng();
+            ::rand::sample(&mut rng, self.tables.keys().cloned(), 1).get(0).cloned()
+        }
+
+        fn get_table(&self, node_name: &XorName) -> &RoutingTable<TestNodeInfo, u64> {
+            self.tables.get(node_name).unwrap()
+        }
+
+        fn get_mut_table(&mut self, node_name: &XorName) -> &mut RoutingTable<TestNodeInfo, u64> {
+            self.tables.get_mut(node_name).unwrap()
+        }
+
+        /// Send a message to the given name: Return all nodes that the message reaches if sent
+        /// from the given proxy, and that believe that they are in the close group of that name.
+        fn find_close_group(&self, proxy_name: &XorName, name: &XorName)
+            -> collections::HashSet<XorName> {
+            // In the beginning, the message is only at the proxy node.
+            let mut msg = MessageStatus::new(proxy_name.clone());
+            let mut result = collections::HashSet::new();
+            while let Some(current_name) = msg.pop() {
+                // Now current_name handles the message and sends it to the target nodes.
+                let table = self.get_table(&current_name);
+                for node_info in table.target_nodes(&name) {
+                    msg.add(node_info.name().clone());
+                }
+                // If current_name thinks it is close, it should be in the result set.
+                if table.is_close(&name) {
+                    result.insert(current_name.clone());
+                }
+            }
+            result
+        }
+
+        /// Adds a new node and updates its routing table and those of its close group.
+        fn add_node_with_close_group(&mut self, proxy_name: &XorName) {
+            // Create a new node with an empty routing table.
+            let node_info = create_random_node_info();
+            let mut table = RoutingTable::new(node_info.name());
+            // Via the proxy node, determine the close group of the new node.
+            let close_group = self.find_close_group(proxy_name, node_info.name());
+            for close_node in close_group {
+                // Add the new node to the close node's routing table.
+                if self.get_mut_table(&close_node).want_to_add(node_info.name()) {
+                    self.get_mut_table(&close_node).add_node(to_node_info(node_info.name())).1.is_some();
+                }
+                // Add the close node to the new node's routing table.
+                let close_info = to_node_info(self.get_mut_table(&close_node).our_name());
+                if table.want_to_add(close_info.name()) {
+                    table.add_node(close_info).1.is_some();
+                }
+                // Add the close node's close group to the new nodes routing table.
+                for other_node in self.get_mut_table(&close_node).our_close_group() {
+                    if table.want_to_add(other_node.name()) {
+                        table.add_node(other_node).1.is_some();
+                    }
+                }
+            }
+            self.tables.insert(node_info.name().clone(), table).is_none();
+        }
+
+        /// Makes every node in the network discover the node with the given name.
+        fn discover_node(&mut self, name: &XorName) {
+            for (_, table) in self.tables.iter_mut() {
+                if table.want_to_add(name) {
+                    table.add_node(to_node_info(name)).1.is_some();
+                }
+            }
+        }
+
+        /// Fully populate all routing tables.
+        fn discover_all_nodes(&mut self) {
+            let node_names: Vec<_> = self.tables.keys().cloned().collect();
+            for node_name in node_names {
+                self.discover_node(&node_name);
+            }
+        }
+
+    }
+
+    #[test]
+    fn test_find_close_group() {
+        let mut test_env = NetworkTestEnvironment::new();
+        let name = test_env.get_random_name().unwrap();
+        assert_eq!(1, test_env.find_close_group(&name, create_random_node_info().name()).len());
+        test_env.add_node_with_close_group(&name);
+    }
+
+    /// Simulate a fully populated network and assert that the close group contains at least
+    /// QUORUM_SIZE and at most 2 * GROUP_SIZE elements.
+    #[test]
+    fn test_send_messages_reaches_close_group() {
+        let mut test_env = NetworkTestEnvironment::new();
+        let proxy = test_env.get_random_name().unwrap();
+        // Add nodes to the network.
+        for _ in 0..300 {
+            test_env.add_node_with_close_group(&proxy);
+        }
+        test_env.discover_all_nodes();
+        // Send messages from random nodes to other random nodes by applying find_close_group: If
+        // the receiver is reachable from the sender then the receiver should be contained in the
+        // returned set.
+        for _ in 0..100 {
+            let sender = test_env.get_random_name().unwrap();
+            let receiver = test_env.get_random_name().unwrap();
+            let close_group = test_env.find_close_group(&sender, &receiver);
+            assert!(close_group.len() < 2 * super::GROUP_SIZE as usize,
+                format!("Close group has {} elements.", close_group.len()));
+            assert!(close_group.len() >= super::QUORUM_SIZE as usize,
+                format!("Close group has {} elements.", close_group.len()));
+        }
+    }
+
+    /// Simulate a fully populated network and assert that messages always reach their destination.
+    #[test]
+    fn test_send_messages_reaches_receiver() {
+        let mut test_env = NetworkTestEnvironment::new();
+        let proxy = test_env.get_random_name().unwrap();
+        // Add nodes to the network.
+        for _ in 0..300 {
+            test_env.add_node_with_close_group(&proxy);
+        }
+        test_env.discover_all_nodes();
+        // Send messages from random nodes to other random nodes by applying find_close_group: If
+        // the receiver is reachable from the sender then the receiver should be contained in the
+        // returned set.
+        for _ in 0..100 {
+            let sender = test_env.get_random_name().unwrap();
+            let receiver = test_env.get_random_name().unwrap();
+            let close_group = test_env.find_close_group(&sender, &receiver);
+            assert!(close_group.contains(&receiver));
+        }
     }
 }
