@@ -1254,7 +1254,7 @@ mod test {
     /// The status of a message in the network: Which nodes have seen it, which currently have it.
     struct MessageStatus {
         seen: collections::HashSet<XorName>,
-        current: Vec<XorName>,
+        current: collections::VecDeque<XorName>,
     }
 
     impl MessageStatus {
@@ -1262,13 +1262,13 @@ mod test {
         fn new(start: XorName) -> MessageStatus {
             MessageStatus {
                 seen: vec!(start.clone()).into_iter().collect(),
-                current: vec!(start),
+                current: vec!(start).into_iter().collect(),
             }
         }
 
         /// Remove and return one of the current nodes to handle the message there.
         fn pop(&mut self) -> Option<XorName> {
-            self.current.pop()
+            self.current.pop_front()
         }
 
         /// Send the message to the given node, i. e. add the node to the current ones if it has
@@ -1276,7 +1276,7 @@ mod test {
         fn add(&mut self, name: XorName) {
             if !self.seen.contains(&name) {
                 self.seen.insert(name.clone());
-                self.current.push(name);
+                self.current.push_back(name);
             }
         }
     }
