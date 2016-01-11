@@ -1274,19 +1274,14 @@ mod test {
         /// Send the message to the given node, i. e. add the node to the current ones if it has
         /// not already seen the message.
         fn add(&mut self, name: XorName) {
-            if !self.seen.contains(&name) {
-                self.seen.insert(name.clone());
+            if self.seen.insert(name.clone()) {
                 self.current.push_back(name);
             }
         }
     }
 
     fn to_node_info(name: &XorName) -> NodeInfo<TestNodeInfo, u64> {
-        NodeInfo {
-            public_id: TestNodeInfo { name: name.clone() },
-            connections: Vec::new(),
-            bucket_index: 0,
-        }
+        NodeInfo::new(TestNodeInfo { name: name.clone() }, vec!())
     }
 
     /// A whole network of nodes with routing tables.
@@ -1347,16 +1342,17 @@ mod test {
             let close_group = self.find_close_group(proxy_name, node_info.name());
             for close_node in close_group {
                 // Add the new node to the close node's routing table.
-                if self.get_mut_table(&close_node).want_to_add(node_info.name()) {
-                    self.get_mut_table(&close_node).add_node(to_node_info(node_info.name())).1.is_some();
+                if self.get_table(&close_node).want_to_add(node_info.name()) {
+                    self.get_mut_table(&close_node)
+                        .add_node(to_node_info(node_info.name())).1.is_some();
                 }
                 // Add the close node to the new node's routing table.
-                let close_info = to_node_info(self.get_mut_table(&close_node).our_name());
+                let close_info = to_node_info(self.get_table(&close_node).our_name());
                 if table.want_to_add(close_info.name()) {
                     table.add_node(close_info).1.is_some();
                 }
                 // Add the close node's close group to the new nodes routing table.
-                for other_node in self.get_mut_table(&close_node).our_close_group() {
+                for other_node in self.get_table(&close_node).our_close_group() {
                     if table.want_to_add(other_node.name()) {
                         table.add_node(other_node).1.is_some();
                     }
