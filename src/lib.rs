@@ -53,7 +53,7 @@ extern crate itertools;
 extern crate rand;
 extern crate xor_name;
 
-use itertools::*;
+use itertools::Itertools;
 
 /// Defines the size of close group
 pub const GROUP_SIZE: u8 = 8;
@@ -92,7 +92,7 @@ pub fn bucket_size() -> usize {
 const OPTIMAL_TABLE_SIZE: u8 = 64;
 /// For tests use a smaller size, since the tests use a smaller simulated network.
 #[cfg(test)]
-const OPTIMAL_TABLE_SIZE: u8 = 16;
+const OPTIMAL_TABLE_SIZE: u8 = 64;
 
 /// optimal table size as usize
 pub fn optimal_table_size() -> usize {
@@ -443,10 +443,11 @@ impl <T : PartialEq + HasName + ::std::fmt::Debug + ::std::clone::Clone,
 #[cfg(test)]
 mod test {
     extern crate bit_vec;
+    use itertools::Itertools;
     use super::{RoutingTable, NodeInfo, group_size, optimal_table_size, parallelism, quorum_size,
                 HasName};
     use std::collections;
-    use xor_name::XorName;
+    use xor_name::{XorName, XOR_NAME_LEN};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestNodeInfo {
@@ -1252,6 +1253,7 @@ mod test {
     }
 
     /// The status of a message in the network: Which nodes have seen it, which currently have it.
+    #[derive(Debug)]
     struct MessageStatus {
         seen: collections::HashSet<XorName>,
         current: collections::VecDeque<XorName>,
@@ -1333,6 +1335,55 @@ mod test {
             result
         }
 
+        #[allow(unsafe_code)]
+        fn distance(lhs: &XorName, rhs: &XorName) -> XorName {
+            let mut result: [u8; XOR_NAME_LEN] = unsafe { ::std::mem::uninitialized() };
+            for i in 0..XOR_NAME_LEN {
+                result[i] = lhs.0[i] ^ rhs.0[i];
+            }
+            XorName::new(result)
+        }
+
+        fn print_real_close_group(&self, target: &XorName) {
+            let tables = self.tables
+                             .iter()
+                             .sorted_by(|a, b| if ::xor_name::closer_to_target(&a.0, &b.0, &target) {
+                                 ::std::cmp::Ordering::Less
+                             } else {
+                                 ::std::cmp::Ordering::Greater
+                             })
+                             .into_iter()
+                             .take(super::GROUP_SIZE as usize)
+                             .collect::<Vec<_>>();
+            println!("");
+            for table in tables.iter() {
+                println!("Actual close node {:?} thinks it is close: {}", table.0, table.1.is_close(target));
+            }
+            println!("");
+            for table in tables.clone() {
+                if table.1.is_close(target) {
+                    continue
+                }
+                println!("{:?} which incorrectly doesn't think it is close to {:?}", table.0, target);
+                let furthest_close = table.1.nodes.iter().nth(group_size() - 1).unwrap();
+                let distance_to_furthest_close = Self::distance(table.0, furthest_close.name());
+                let distance_to_target = Self::distance(table.0, target);
+                let close_group = table.1.our_close_group().iter().map(|elt| elt.name().clone()).collect::<Vec<_>>();
+                println!("   furthest_close:             {:?}", furthest_close.name());
+                println!("   distance_to_furthest_close: {:?}", distance_to_furthest_close);
+                println!("   distance_to_target:         {:?}", distance_to_target);
+                println!("   close group member | is close to target | distance to target");
+                println!("   ===================|====================|===================");
+                for member in close_group.iter() {
+                    println!("       {:?} | {}\t           | {:?}",
+                             member,
+                             tables.iter().any(|table| table.0 == member),
+                             Self::distance(member, target));
+                }
+                println!("");
+            }
+        }
+
         /// Adds a new node and updates its routing table and those of its close group.
         fn add_node_with_close_group(&mut self, proxy_name: &XorName) {
             // Create a new node with an empty routing table.
@@ -1378,6 +1429,12 @@ mod test {
             }
         }
 
+        // fn print_table_sizes(&self) {
+        //     for (_, table) in self.tables.iter() {
+        //         let indices = table.nodes.iter().map(|node_info| node_info.bucket_index).collect::<::std::collections::BTreeSet<_>>();
+        //         println!("{} -- {:?}", table.len(), indices);
+        //     }
+        // }
     }
 
     #[test]
@@ -1399,6 +1456,7 @@ mod test {
             test_env.add_node_with_close_group(&proxy);
         }
         test_env.discover_all_nodes();
+//        test_env.print_table_sizes();
         // Send messages from random nodes to other random nodes by applying find_close_group: If
         // the receiver is reachable from the sender then the receiver should be contained in the
         // returned set.
@@ -1408,6 +1466,9 @@ mod test {
             let close_group = test_env.find_close_group(&sender, &receiver);
             assert!(close_group.len() < 2 * super::GROUP_SIZE as usize,
                 format!("Close group has {} elements.", close_group.len()));
+            if close_group.len() < super::QUORUM_SIZE as usize {
+                test_env.print_real_close_group(&receiver);
+            }
             assert!(close_group.len() >= super::QUORUM_SIZE as usize,
                 format!("Close group has {} elements.", close_group.len()));
         }
